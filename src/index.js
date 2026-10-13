@@ -398,7 +398,7 @@ async function provisionLocalBackend(name = '', baseUrl = 'https://blubase-agent
     execSync(`${pbBinary} admin create ${adminEmail} ${adminPassword} --dir=${dir}`, { stdio: 'ignore' });
   } catch (e) {}
 
-  const publicUrl = `${req.protocol}://${req.get("host")}/backend/${serviceName}`;
+  const publicUrl = `${baseUrl}/backend/${serviceName}`;
   const conn = await addConnection({
     type: 'pocketbase',
     name: serviceName,
