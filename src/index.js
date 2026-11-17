@@ -353,6 +353,7 @@ async function provisionLocalBackend(name, baseUrl) {
   baseUrl = baseUrl || 'https://blubase-agent-1.onrender.com';
   const serviceName = (name || ('pb-' + Date.now())).toLowerCase().replace(/[^a-z0-9-]/g, '-');
   const dir = './pb_instances/' + serviceName;
+  await restoreInstance(serviceName, dir);
   if (fs.existsSync(dir)) throw new Error('Instance already exists: ' + serviceName);
   fs.mkdirSync(dir, { recursive: true });
 
@@ -411,6 +412,7 @@ async function provisionLocalBackend(name, baseUrl) {
     }
   }
 
+  await backupInstance(serviceName, dir);
   const publicUrl = baseUrl + '/backend/' + serviceName;
   const conn = await addConnection({
     type: 'pocketbase',
@@ -438,6 +440,55 @@ async function provisionLocalBackend(name, baseUrl) {
       password: adminPassword
     }
   };
+}
+
+// ============================================================
+// SQLite persistence helpers (backup/restore to S3)
+// ============================================================
+async function backupInstance(name, dir) {
+  if (!BUCKET) return false;
+  try {
+    const files = ["data.db", "data.db-wal", "data.db-shm"];
+    const payload = { at: new Date().toISOString(), files: {} };
+    let totalBytes = 0;
+    for (const f of files) {
+      const fp = require("path").join(dir, f);
+      if (fs.existsSync(fp)) {
+        const buf = fs.readFileSync(fp);
+        payload.files[f] = buf.toString("base64");
+        totalBytes += buf.length;
+      }
+    }
+    if (totalBytes === 0) return false;
+    await s3Put("backends/" + name + "/sqlite.json", JSON.stringify(payload));
+    console.log("[Persist] " + name + " backed up (" + totalBytes + " bytes)");
+    return true;
+  } catch (e) {
+    console.error("[Persist] " + name + " backup failed: " + e.message);
+    return false;
+  }
+}
+
+async function restoreInstance(name, dir) {
+  if (!BUCKET) return false;
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const raw = await s3Get("backends/" + name + "/sqlite.json");
+    if (!raw) return false;
+    const payload = JSON.parse(raw);
+    if (!payload.files) return false;
+    let restored = 0;
+    for (const [f, b64] of Object.entries(payload.files)) {
+      const fp = require("path").join(dir, f);
+      fs.writeFileSync(fp, Buffer.from(b64, "base64"));
+      restored++;
+    }
+    console.log("[Restore] " + name + " restored " + restored + " file(s) from S3");
+    return restored > 0;
+  } catch (e) {
+    console.error("[Restore] " + name + " failed: " + e.message);
+    return false;
+  }
 }
 
 // ============================================================
@@ -555,10 +606,11 @@ async function runAgent(message, req, userId, sessionId) {
       result = { success: true, backend: c.name, collections: await adapter.getCollections() };
       break;
     }
-    case 'create_collection': {
+    case 'create_collection': { // PERSIST_AFTER_CREATE_COLLECTION
       const c = findBackend(action.backend);
       const adapter = getAdapter(c);
       result = { success: true, backend: c.name, result: await adapter.createCollection(action.schema) };
+      if (c.localUrl) { const inst = c.name; const instDir = './pb_instances/' + inst; await backupInstance(inst, instDir); }
       break;
     }
     case 'list_records': {
@@ -571,12 +623,14 @@ async function runAgent(message, req, userId, sessionId) {
       const c = findBackend(action.backend);
       const adapter = getAdapter(c);
       result = { success: true, backend: c.name, collection: action.collection, record: await adapter.create(action.collection || '', action.data) };
+      await backupInstance(c.name, './pb_instances/' + c.name); // PERSIST_AFTER_CREATE_RECORD
       break;
     }
     case 'update_record': {
       const c = findBackend(action.backend);
       const adapter = getAdapter(c);
       result = { success: true, backend: c.name, collection: action.collection, record: await adapter.update(action.collection || '', action.id || '', action.data) };
+      await backupInstance(c.name, './pb_instances/' + c.name); // PERSIST_AFTER_UPDATE_RECORD
       break;
     }
     case 'delete_record': {
@@ -584,6 +638,7 @@ async function runAgent(message, req, userId, sessionId) {
       const adapter = getAdapter(c);
       await adapter.delete(action.collection || '', action.id || '');
       result = { success: true, backend: c.name, collection: action.collection, deletedId: action.id };
+      await backupInstance(c.name, './pb_instances/' + c.name); // PERSIST_AFTER_DELETE_RECORD
       break;
     }
     case 'call_edge_function': {
@@ -731,7 +786,28 @@ app.use(function(err, _req, res, _next) {
 // ============================================================
 (async function() {
   await loadConnections();
-  app.listen(config.port, '0.0.0.0', function() {
+  // Restore all PocketBase instances from S3 before serving traffic
+  for (const conn of connections.values()) {
+    if (conn.type === "pocketbase" && conn.localUrl) {
+      const dir = "./pb_instances/" + conn.name;
+      const restored = await restoreInstance(conn.name, dir);
+      if (restored) console.log("[Startup] Restored " + conn.name);
+      // Spawn the PocketBase process for this backend
+      try {
+        const portMatch = conn.localUrl.match(/:([0-9]+)/);
+        const port = portMatch ? parseInt(portMatch[1]) : null;
+        if (port && fs.existsSync("./pocketbase")) {
+          const { spawn } = require("child_process");
+          const child = spawn("./pocketbase", ["serve", "--http=127.0.0.1:" + port, "--dir=" + dir], { detached: true, stdio: "ignore" });
+          child.unref();
+          console.log("[Startup] Spawned PocketBase for " + conn.name + " on port " + port);
+        }
+      } catch (spawnErr) {
+        console.error("[Startup] Failed to spawn " + conn.name + ": " + spawnErr.message);
+      }
+    }
+  }
+  app.listen(config.port, "0.0.0.0", function() {
     console.log('🚀 BluBase Agent running on PORT ' + config.port);
   });
 })();
